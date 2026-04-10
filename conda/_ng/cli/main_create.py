@@ -13,13 +13,12 @@ if TYPE_CHECKING:
 def execute(args: Namespace, parser: ArgumentParser) -> int:
     from pathlib import Path
 
-    import rich
     from rattler import MatchSpec
 
     from conda.base.context import context
     from conda.exceptions import ArgumentError
 
-    from .common import activate_panel, as_virtual_package
+    from .common import as_virtual_package
     from .install import install
 
     if not args.name and not args.prefix and not context.dry_run:
@@ -42,15 +41,15 @@ def execute(args: Namespace, parser: ArgumentParser) -> int:
     ]
     install(
         specs=specs,
+        user_specs=specs,
         channels=context.channels,
         platform=context.subdir,
         target_prefix=target_prefix,
         virtual_packages=virtual_packages,
         report=not context.quiet and not context.json,
         dry_run=context.dry_run,
+        cli_operation="create",
+        env_display_name=args.name,
     )
-
-    if not context.quiet and not context.json:
-        rich.print(activate_panel(args.name or target_prefix))
 
     return 0

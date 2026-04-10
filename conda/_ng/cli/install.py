@@ -38,14 +38,19 @@ def install(
     report: bool = True,
     removing: bool = False,
     t0: float | None = None,
+    cli_operation: str | None = None,
+    env_display_name: str | None = None,
 ) -> Iterable[PackageRecord]:
     import asyncio
     import time
-    from datetime import timedelta
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
 
     from rattler import Client, Gateway, MatchSpec, SourceConfig, solve
     from rattler import install as rattler_install
     from rattler.exceptions import GatewayError, SolverError
+    from rich.live import Live
+    from rich.text import Text
 
     from conda.base.context import context
     from conda.exceptions import CondaError, CondaExitZero, DryRunExit
@@ -53,7 +58,13 @@ def install(
     from conda.reporters import confirm_yn
 
     from ..exceptions import CondaSolverError
-    from .common import cache_dir, create_console, installed_packages
+    from . import ux_reporting
+    from .common import (
+        cache_dir,
+        channel_name_or_url,
+        create_console,
+        installed_packages,
+    )
 
     specs = [MatchSpec(spec) if isinstance(spec, str) else spec for spec in specs]
     history = [MatchSpec(spec) if isinstance(spec, str) else spec for spec in history]
@@ -68,10 +79,14 @@ def install(
     gateway_config = SourceConfig(
         cache_action="force-cache-only" if context.offline else "cache-or-fetch"
     )
+
+    console = create_console()
+    use_ng_transaction_ui = report and console.is_terminal and not context.json
+    # Repodata fetch uses Rattler's default bars; off here so install matches conda-ng scale UI.
     gateway = Gateway(
         cache_dir=cache_dir("index"),
         client=client,
-        show_progress=report,
+        show_progress=False,
         default_config=gateway_config,
     )
 
@@ -87,9 +102,11 @@ def install(
             constraints=constraints,
         )
 
-    console = create_console()
+    t_wall0 = time.perf_counter()
+    channels_list = list(channels)
+
     if context.verbose:
-        console.print(f"[dim]channels:[/] {','.join(map(str, channels))}")
+        console.print(f"[dim]channels:[/] {','.join(map(str, channels_list))}")
         console.print(f"[dim]platform:[/] {platform}")
         if target_prefix:
             console.print(f"[dim]prefix:[/] {target_prefix}")
@@ -100,22 +117,53 @@ def install(
         specs_to_remove=user_specs or specs if removing else (),
     )
 
-    t0 = t0 or time.perf_counter()
-    with console.status("solving"):
-        try:
+    if dry_run and report:
+        ux_reporting.print_dry_run_banner(console)
+
+    t_solve0 = t0 or time.perf_counter()
+    ng_tx: ux_reporting.NgThreePhaseTransactionUX | None = None
+    ng_live: Live | None = None
+    try:
+        if use_ng_transaction_ui:
+            ng_tx = ux_reporting.NgThreePhaseTransactionUX(
+                console, verbose_style=context.verbose
+            )
+            ng_tx.reset_for_transaction()
+            ng_live = Live(
+                ng_tx.render(),
+                console=console,
+                refresh_per_second=12,
+                transient=True,
+            )
+            ng_live.start()
+            ng_tx.attach_live(ng_live)
+            try:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    fut = pool.submit(lambda: asyncio.run(inner_solve()))
+                    records = ng_tx.wait_future_with_live(ng_live, fut)
+                ng_tx.set_solve_finished()
+                ng_live.update(ng_tx.render(), refresh=True)
+            finally:
+                ng_live.stop()
+                ng_tx.attach_live(None)
+        else:
             records = asyncio.run(inner_solve())
-        except SolverError as exc:
-            raise CondaSolverError(str(exc)) from exc
-        except GatewayError as exc:
-            raise CondaError(f"Connection error:\n\n{exc}") from exc
-    t1 = time.perf_counter()
-    delta = timedelta(seconds=t1 - t0)
-    console.print(
-        f"[green]✔[/] solving [dim]{len(records)} packages in "
-        + (f"{delta.seconds}s " if delta.seconds else "")
-        + f"{delta.microseconds / 1000:.0f}ms",
-        highlight=False,
-    )
+    except SolverError as exc:
+        raise CondaSolverError(str(exc)) from exc
+    except GatewayError as exc:
+        raise CondaError(f"Connection error:\n\n{exc}") from exc
+
+    t_solve1 = time.perf_counter()
+    if report and not use_ng_transaction_ui:
+        ux_reporting.print_phase_footer(
+            console,
+            step=1,
+            n_steps=2,
+            label="Resolving dependencies...",
+            suffix=None,
+            pct=100,
+            elapsed_s=t_solve1 - t_solve0,
+        )
 
     if target_prefix:
         installed = list(installed_packages(target_prefix))
@@ -130,7 +178,7 @@ def install(
     to_unlink, to_link = diff_for_unlink_link_precs(
         previous_records=installed,
         new_records=records,
-        specs_to_add=user_specs,
+        specs_to_add=user_specs or specs,
     )
     context.plugin_manager.invoke_post_solves("repodata.json", to_unlink, to_link)
 
@@ -138,23 +186,45 @@ def install(
         raise CondaExitZero("Nothing to do.")
 
     if report:
-        console.print(
-            "",
-            solution_table(
-                records=records,
-                specs=specs,
-                installed=installed,
-                history=history,
-                removing=removing,
-            ),
-        )
+        if context.verbose:
+            console.print(
+                "",
+                solution_table(
+                    records=records,
+                    specs=specs,
+                    installed=installed,
+                    history=history,
+                    removing=removing,
+                ),
+            )
+        else:
+            console.print()
 
     if dry_run:
+        if report and target_prefix:
+            if cli_operation == "create":
+                ux_reporting.print_dry_run_would_create(
+                    console,
+                    prefix=target_prefix,
+                    write_env_yml_hint=True,
+                )
+            else:
+                console.print(
+                    Text.from_markup(
+                        f"[dim]  Would modify  {ux_reporting.display_prefix(target_prefix)}[/]"
+                    )
+                )
+                console.print()
+        if report:
+            ux_reporting.print_dry_run_done(console)
         raise DryRunExit()
 
     confirm_yn(f"\nApply changes to '{target_prefix}'?")
 
-    async def inner_install():
+    if report and context.verbose and not use_ng_transaction_ui:
+        ux_reporting.print_verbose_working_header(console)
+
+    async def inner_install(rep: object | None) -> None:
         await rattler_install(
             records=records,
             target_prefix=target_prefix,
@@ -163,7 +233,8 @@ def install(
             execute_link_scripts=True,
             # TODO: Fix the need to pass the inner PyMatchSpec
             requested_specs=[s._match_spec for s in (user_specs or specs)],
-            show_progress=report,
+            show_progress=False,
+            reporter=rep,
             client=client,
         )
 
@@ -181,12 +252,105 @@ def install(
         action.execute()
 
     # Write History ourselves, rattler doesn't do that yet
+    t_fetch_install0 = time.perf_counter()
     with History(target_prefix) as h:
-        asyncio.run(inner_install())
+        if use_ng_transaction_ui and ng_tx is not None and ng_live is not None:
+            ng_live.start(refresh=True)
+            ng_tx.attach_live(ng_live)
+            try:
+                ng_tx.begin_install(list(to_link))
+                reporter = ux_reporting.NgUnifiedPhaseReporter(ng_tx)
+
+                def work_install() -> None:
+                    asyncio.run(inner_install(reporter))
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    fut = pool.submit(work_install)
+                    ng_tx.wait_future_with_live(ng_live, fut)
+                ng_tx.finalize_install_progress()
+                ng_live.update(ng_tx.render(), refresh=True)
+            finally:
+                ng_live.stop()
+                ng_tx.attach_live(None)
+        else:
+            asyncio.run(inner_install(None))
+    t_fetch_install1 = time.perf_counter()
     if not removing:
         h.write_specs(update_specs=list(map(str, (user_specs or specs))))
-    if report:
-        print()
+    fetch_install_elapsed = t_fetch_install1 - t_fetch_install0
+    mb_fetch = ux_reporting.total_download_mb(to_link)
+
+    if report and not use_ng_transaction_ui:
+        parts: list[str] = []
+        if mb_fetch is not None:
+            parts.append(f"{mb_fetch:.1f} MB")
+        parts.append(f"{len(to_link)} packages")
+        ux_reporting.print_phase_footer(
+            console,
+            step=2,
+            n_steps=2,
+            label="Downloading and installing packages...",
+            suffix=" · ".join(parts),
+            pct=100,
+            elapsed_s=fetch_install_elapsed,
+        )
+
+    t_wall1 = time.perf_counter()
+    elapsed_total = t_wall1 - t_wall0
+
+    if not context.json and target_prefix and not dry_run:
+        req_specs = tuple(user_specs or specs)
+        req_recs, dep_recs = ux_reporting.requested_vs_dependencies(to_link, req_specs)
+        # Named envs: `conda activate name`. Prefix-only: use resolved absolute path so we
+        # never suggest relative paths like `conda activate ./devenv`.
+        prefix_resolved = Path(target_prefix).expanduser().resolve()
+        if env_display_name:
+            tok = str(env_display_name)
+            activate_cmd = (
+                f'conda activate "{tok}"' if " " in tok else f"conda activate {tok}"
+            )
+            quiet_env_label = tok
+        else:
+            ap = prefix_resolved.as_posix()
+            activate_cmd = (
+                f'conda activate "{ap}"' if " " in ap else f"conda activate {ap}"
+            )
+            quiet_env_label = ux_reporting.display_prefix(prefix_resolved)
+
+        if not report and context.quiet:
+            mb_q = ux_reporting.total_download_mb(to_link)
+            ux_reporting.print_quiet_done(
+                console,
+                env_label=quiet_env_label,
+                n_packages=len(to_link),
+                mb=mb_q,
+                activate_cmd=activate_cmd,
+            )
+        elif report and not removing and to_link:
+            if cli_operation == "create":
+                title = env_display_name or Path(target_prefix).name
+                ux_reporting.print_create_success_card(
+                    console,
+                    env_title=str(title),
+                    prefix=target_prefix,
+                    channels=channels_list,
+                    platform=platform,
+                    requested=req_recs,
+                    dependencies=dep_recs,
+                    elapsed_s=elapsed_total,
+                    channel_name_or_url=channel_name_or_url,
+                    activate_cmd=activate_cmd,
+                    verbose=context.verbose,
+                )
+            else:
+                ux_reporting.print_install_success_card(
+                    console,
+                    requested=req_recs,
+                    dependencies=dep_recs,
+                    elapsed_s=elapsed_total,
+                    channel_name_or_url=channel_name_or_url,
+                    verbose=context.verbose,
+                )
 
     # post-transaction
     for action in context.plugin_manager.get_pre_transaction_actions(
@@ -372,7 +536,7 @@ def diff_for_unlink_link_precs(
 
     def _add_to_unlink_and_link(rec):
         link_precs.add(rec)
-        if prec in previous_records:
+        if rec in previous_set:
             unlink_precs.add(rec)
 
     # If force_reinstall is enabled, make sure any package in specs_to_add is unlinked then

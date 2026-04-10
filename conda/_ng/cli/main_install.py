@@ -37,6 +37,7 @@ def execute(args: Namespace, parser: ArgumentParser) -> int:
     ]
     install(
         specs=specs,
+        user_specs=specs,
         history=history,
         channels=context.channels,
         platform=context.subdir,
@@ -45,6 +46,7 @@ def execute(args: Namespace, parser: ArgumentParser) -> int:
         virtual_packages=virtual_packages,
         report=not context.quiet and not context.json,
         dry_run=context.dry_run,
+        cli_operation="install",
     )
 
     return 0
