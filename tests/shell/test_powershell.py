@@ -118,6 +118,47 @@ def test_powershell_basic_integration(
         sh.assert_env_var("CONDA_SHLVL", "0")
 
 
+@PARAMETRIZE_POWERSHELL
+def test_powershell_tab_completion(
+    shell_wrapper_integration: tuple[str, str, str],
+    shell: Shell,
+) -> None:
+    """Verify Register-ArgumentCompleter is used (no TabExpansion override) and
+    that the completer returns sensible results."""
+    with shell.interactive() as sh:
+        # Old posh-git TabExpansion override must NOT be defined.
+        sh.sendline("Test-Path Function:\\TabExpansion")
+        sh.expect_exact("False")
+
+        # Subcommand completion: 'conda ' must return known subcommands.
+        sh.sendline(
+            "$t = (TabExpansion2 'conda ' 6).CompletionMatches.CompletionText; "
+            "($t -contains 'install') -and ($t -contains 'activate')"
+        )
+        sh.expect_exact("True")
+
+        # Environment-name completion for 'conda activate ': must include 'base'.
+        sh.sendline(
+            "$t = (TabExpansion2 'conda activate ' 15).CompletionMatches.CompletionText; "
+            "$t -contains 'base'"
+        )
+        sh.expect_exact("True")
+
+        # Solver-value completion after '--solver '.
+        sh.sendline(
+            "$t = (TabExpansion2 'conda install --solver ' 23).CompletionMatches.CompletionText; "
+            "($t -contains 'classic') -and ($t -contains 'libmamba')"
+        )
+        sh.expect_exact("True")
+
+        # Nested subcommand completion for 'conda repoquery '.
+        sh.sendline(
+            "$t = (TabExpansion2 'conda repoquery ' 16).CompletionMatches.CompletionText; "
+            "($t -contains 'whoneeds') -and ($t -contains 'depends')"
+        )
+        sh.expect_exact("True")
+
+
 @pytest.mark.skipif(on_win, reason="unavailable on Windows")
 @PARAMETRIZE_POWERSHELL
 def test_powershell_PATH_management(
